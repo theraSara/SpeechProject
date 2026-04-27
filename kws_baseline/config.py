@@ -2,6 +2,22 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import os
 
+KNOWN_GSC = [
+    "yes", "no", "up", "down", "left",
+    "right", "on", "off", "stop", "go",
+]
+
+UNKNOWN_GSC = [
+    "zero", "one", "two", "three", "four",
+    "five", "six", "seven", "eight", "nine",
+    "bed", "bird", "cat", "dog", "happy",
+    "house", "marvin", "sheila", "tree", "wow",
+]
+
+# Held-out GSC words for threshold tuning only
+VAL_KNOWN_GSC = ["backward", "forward"]
+VAL_UNKNOWN_GSC = ["follow", "learn", "visual"]
+
 
 @dataclass
 class AudioConfig:
@@ -13,7 +29,7 @@ class AudioConfig:
     hop_length: int = 160
     win_length: int = 400
     n_mels: int = 40
-    include_delta: bool = True  # 13*3 = 39 features
+    include_delta: bool = True  # 13 * 3 = 39 dims
 
 
 @dataclass
@@ -21,34 +37,25 @@ class DataConfig:
     """Dataset and split settings."""
     gsc_root: str = "./data/SpeechCommands/speech_commands_v0.02"
 
-    # ---- Evaluation keywords (8 known + 8 unknown) ----
-    known_keywords: List[str] = field(default_factory=lambda: [
-        "yes", "no", "up", "down", "go",
-        "stop", "left", "right"
-    ])
+    split_manifest_template: Optional[str] = None
 
-    unknown_keywords: List[str] = field(default_factory=lambda: [
-        "bed", "bird", "cat", "dog",
-        "happy", "house", "marvin", "sheila"
-    ])
+    known_keywords: List[str] = field(default_factory=lambda: KNOWN_GSC.copy())
+    unknown_keywords: List[str] = field(default_factory=lambda: UNKNOWN_GSC.copy())
 
-    # ---- Validation keywords (SEPARATE from eval, for threshold tuning) ----
-    # These keywords appear NOWHERE in the test evaluation
-    val_known_keywords: List[str] = field(default_factory=lambda: [
-        "on", "off"
-    ])
-    val_unknown_keywords: List[str] = field(default_factory=lambda: [
-        "tree", "wow"
-    ])
+    # Validation classes are disjoint from final eval classes
+    val_known_keywords: List[str] = field(default_factory=lambda: VAL_KNOWN_GSC.copy())
+    val_unknown_keywords: List[str] = field(default_factory=lambda: VAL_UNKNOWN_GSC.copy())
 
     k_shots: List[int] = field(default_factory=lambda: [5, 10])
-    n_test_per_keyword: int = 50
-    n_test_unknown: int = 200
 
-    # For validation threshold tuning
-    val_k_shot: int = 5  # enroll val keywords with this many shots
-    n_val_per_keyword: int = 40  # test utterances per val keyword
-    n_val_unknown: int = 80
+    # Per-class counts
+    n_test_per_keyword: int = 50
+    n_test_unknown_per_keyword: int = 50
+
+    # Validation for threshold tuning
+    val_k_shot: int = 5
+    n_val_per_keyword: int = 40
+    n_val_unknown_per_keyword: int = 40
 
     seed: int = 42
 
@@ -56,17 +63,17 @@ class DataConfig:
 @dataclass
 class DTWConfig:
     """DTW baseline settings."""
-    distance_metric: str = "cosine"     # Changed: cosine works better in high dims
-    aggregation: str = "min"            # Changed: min is more robust than mean
-    use_sakoe_chiba_band: bool = True   # Constraint to speed up + regularize
-    sakoe_chiba_radius: int = 10        # Band width in frames
+    distance_metric: str = "cosine"
+    aggregation: str = "min"
+    use_sakoe_chiba_band: bool = True
+    sakoe_chiba_radius: int = 10
 
 
 @dataclass
 class HMMConfig:
     """HMM/GMM baseline settings."""
     n_states: int = 5
-    n_mix: int = 1
+    n_mix: int = 2             
     covariance_type: str = "diag"
     n_iter: int = 50
     topology: str = "left-right"
@@ -79,7 +86,11 @@ class HMMConfig:
 class EvalConfig:
     """Evaluation settings."""
     n_trials: int = 5
+    # tune threshold to 5% FAR on validation
+    target_far: float = 0.05    
     output_dir: str = "./results"
+    save_per_trial: bool = True
+    official_metrics_mode: bool = True
 
 
 @dataclass
@@ -93,3 +104,11 @@ class Config:
 
     def __post_init__(self):
         os.makedirs(self.eval.output_dir, exist_ok=True)
+
+        eval_classes = set(self.data.known_keywords) | set(self.data.unknown_keywords)
+        val_classes = set(self.data.val_known_keywords) | set(self.data.val_unknown_keywords)
+        overlap = eval_classes & val_classes
+        if overlap:
+            raise ValueError(
+                f"Validation keywords must be disjoint from evaluation keywords: {sorted(overlap)}"
+            )

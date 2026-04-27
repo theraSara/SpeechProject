@@ -1,11 +1,12 @@
 import numpy as np
-from typing import Dict, List, Tuple, Optional
-from dtw import dtw as dtw_compute
 import time
 from tqdm import tqdm
+from typing import Dict, List, Tuple, Optional
+from dtw import dtw as dtw_compute
 
 from config import Config, DTWConfig
 from data_loader import FewShotSplit
+from evaluation import find_threshold_for_target_far
 from feature_extraction import extract_features_batch
 
 
@@ -19,6 +20,7 @@ class DTWKeywordSpotter:
 
         self.templates: Dict[str, List[np.ndarray]] = {}
         self.keywords: List[str] = []
+        self.last_threshold_stats: Dict[str, float] = {}
         self.rejection_threshold: float = float('inf')
 
     def enroll(self, keywords: List[str], enrollment: Dict[str, List[str]]):
@@ -129,84 +131,57 @@ class DTWKeywordSpotter:
 
     def tune_threshold(self, split: FewShotSplit) -> float:
         """
-        Tune rejection threshold on VALIDATION keywords.
-        
-        KEY FIX: We enroll the validation keywords separately, then
-        test val_known (should be accepted) vs val_unknown (should be rejected).
-        This gives the threshold tuner real signal.
+        Tune rejection threshold on validation keywords to hit target FAR.
         """
-        print("[DTW] Tuning threshold on validation keywords...")
+        print(
+            f"[DTW] Tuning threshold on validation keywords "
+            f"for target FAR={self.config.eval.target_far:.2%}..."
+        )
 
-        # Temporarily enroll validation keywords
         original_templates = self.templates.copy()
         original_keywords = self.keywords.copy()
 
-        # Enroll val keywords
-        val_keywords = split.val_known_keywords
-        val_templates = {}
-        for kw in val_keywords:
-            features = extract_features_batch(
-                split.val_enrollment[kw], self.audio_cfg
-            )
-            val_templates[kw] = features
+        self.templates = {
+            kw: extract_features_batch(split.val_enrollment[kw], self.audio_cfg)
+            for kw in split.val_known_keywords
+        }
+        self.keywords = split.val_known_keywords
+        self.rejection_threshold = float("inf")
 
-        self.templates = val_templates
-        self.keywords = val_keywords
-        self.rejection_threshold = float('inf')  # No rejection during scoring
-
-        # Score val known (should be close to their enrolled keyword)
         val_distances_known = []
-        for kw, files in split.val_test_known.items():
+        for _, files in split.val_test_known.items():
             features = extract_features_batch(files, self.audio_cfg)
             for feat in features:
                 _, dist, _ = self.predict_single(feat)
                 val_distances_known.append(dist)
 
-        # Score val unknown (should be far from all enrolled keywords)
         val_distances_unknown = []
-        unknown_features = extract_features_batch(
-            split.val_test_unknown, self.audio_cfg
-        )
+        unknown_features = extract_features_batch(split.val_test_unknown, self.audio_cfg)
         for feat in unknown_features:
             _, dist, _ = self.predict_single(feat)
             val_distances_unknown.append(dist)
 
-        # Restore original enrollment
         self.templates = original_templates
         self.keywords = original_keywords
 
-        # Find best threshold
-        val_distances_known = np.array(val_distances_known)
-        val_distances_unknown = np.array(val_distances_unknown)
-
-        print(f"  Val known distances:   mean={val_distances_known.mean():.2f}, "
-              f"std={val_distances_known.std():.2f}")
-        print(f"  Val unknown distances: mean={val_distances_unknown.mean():.2f}, "
-              f"std={val_distances_unknown.std():.2f}")
-
-        all_dists = np.concatenate([val_distances_known, val_distances_unknown])
-        thresholds = np.linspace(
-            np.percentile(all_dists, 1),
-            np.percentile(all_dists, 99),
-            200
+        stats = find_threshold_for_target_far(
+            known_values=np.array(val_distances_known),
+            unknown_values=np.array(val_distances_unknown),
+            target_far=self.config.eval.target_far,
+            score_type="distance",
         )
 
-        best_threshold = thresholds[0]
-        best_score = 0
+        self.rejection_threshold = stats["threshold"]
+        self.last_threshold_stats = stats
 
-        for t in thresholds:
-            known_accepted = np.mean(val_distances_known <= t)
-            unknown_rejected = np.mean(val_distances_unknown > t)
-            score = (known_accepted + unknown_rejected) / 2
-            if score > best_score:
-                best_score = score
-                best_threshold = t
+        print(
+            f"  Threshold={stats['threshold']:.4f} | "
+            f"val FAR={stats['far'] * 100:.2f}% | "
+            f"val FRR={stats['frr'] * 100:.2f}% | "
+            f"known accept={stats['known_accept_rate'] * 100:.2f}%"
+        )
 
-        self.rejection_threshold = best_threshold
-        print(f"  Best threshold: {best_threshold:.4f} "
-              f"(balanced acc: {best_score:.4f})")
-
-        return best_threshold
+        return self.rejection_threshold
 
     def get_timing_info(self, n_samples: int = 10) -> Dict:
         """Measure inference time per utterance."""

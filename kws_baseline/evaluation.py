@@ -1,3 +1,4 @@
+import csv
 import numpy as np
 from typing import Dict, List, Tuple
 from sklearn.metrics import (
@@ -6,7 +7,7 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
+
 
 
 def compute_metrics(results: Dict) -> Dict:
@@ -200,45 +201,236 @@ def plot_distance_distributions(
     return fig
 
 
+def find_threshold_for_target_far(
+    known_values: np.ndarray,
+    unknown_values: np.ndarray,
+    target_far: float,
+    score_type: str = "distance",
+) -> Dict[str, float]:
+    """
+    Choose the most permissive threshold that still satisfies FAR <= target_far.
+    For DTW:
+        accept if distance <= threshold
+    For HMM:
+        accept if score >= threshold
+    """
+    known = np.asarray(known_values, dtype=float)
+    unknown = np.asarray(unknown_values, dtype=float)
+
+    if known.size == 0 or unknown.size == 0:
+        raise ValueError("known_values and unknown_values must be non-empty")
+
+    candidates = np.unique(np.concatenate([known, unknown]))
+    eps = 1e-8
+
+    if score_type == "distance":
+        candidates = np.concatenate(([candidates.min() - eps], candidates, [candidates.max() + eps]))
+        far_fn = lambda t: float(np.mean(unknown <= t))
+        known_accept_fn = lambda t: float(np.mean(known <= t))
+    elif score_type == "score":
+        candidates = np.concatenate(([candidates.max() + eps], candidates[::-1], [candidates.min() - eps]))
+        far_fn = lambda t: float(np.mean(unknown >= t))
+        known_accept_fn = lambda t: float(np.mean(known >= t))
+    else:
+        raise ValueError(f"Unknown score_type: {score_type}")
+
+    best = None
+    for t in candidates:
+        far = far_fn(t)
+        known_accept = known_accept_fn(t)
+        record = {
+            "threshold": float(t),
+            "target_far": float(target_far),
+            "far": float(far),
+            "frr": float(1.0 - known_accept),
+            "known_accept_rate": float(known_accept),
+            "unknown_reject_rate": float(1.0 - far),
+            "balanced_acc": float((known_accept + (1.0 - far)) / 2.0),
+        }
+
+        if far <= target_far + 1e-12:
+            if best is None:
+                best = record
+            else:
+                better_known = record["known_accept_rate"] > best["known_accept_rate"] + 1e-12
+                equal_known = abs(record["known_accept_rate"] - best["known_accept_rate"]) <= 1e-12
+                better_far = record["far"] < best["far"] - 1e-12
+                if better_known or (equal_known and better_far):
+                    best = record
+
+    if best is None:
+        # conservative fallback
+        t = float(candidates[0])
+        far = far_fn(t)
+        known_accept = known_accept_fn(t)
+        best = {
+            "threshold": t,
+            "target_far": float(target_far),
+            "far": float(far),
+            "frr": float(1.0 - known_accept),
+            "known_accept_rate": float(known_accept),
+            "unknown_reject_rate": float(1.0 - far),
+            "balanced_acc": float((known_accept + (1.0 - far)) / 2.0),
+        }
+
+    return best
+
+def apply_threshold_to_results(
+    results: Dict,
+    threshold: float,
+    score_key: str = "distances",
+    score_type: str = "distance",
+) -> Dict:
+    """
+    Take raw predictions (with rejection disabled) and apply a threshold afterward.
+    """
+    out = {}
+    for k, v in results.items():
+        if isinstance(v, list):
+            out[k] = list(v)
+        else:
+            out[k] = v
+
+    scores = np.array(results[score_key], dtype=float)
+    base_preds = np.array(results["predictions"], dtype=object)
+
+    if score_type == "distance":
+        accepted = scores <= threshold
+    elif score_type == "score":
+        accepted = scores >= threshold
+    else:
+        raise ValueError(f"Unknown score_type: {score_type}")
+
+    final_preds = np.where(accepted, base_preds, "unknown")
+
+    out["predictions"] = final_preds.tolist()
+    out["accepted"] = accepted.tolist()
+    out["threshold"] = float(threshold)
+    return out
+
+
+def compute_fixed_far_metrics(
+    results: Dict,
+    target_far: float = 0.05,
+    score_key: str = "distances",
+    score_type: str = "distance",
+) -> Dict:
+    """
+    Compute:
+      - ACC+_5%  -> known accuracy at threshold fixed by FAR <= 5%
+      - AUROC    -> ROC AUC for known vs unknown
+      - FRR+_5%  -> false rejection rate at the same threshold
+    """
+    scores = np.array(results[score_key], dtype=float)
+    is_known = np.array(results["is_known"], dtype=bool)
+    true_labels = np.array(results["true_labels"], dtype=object)
+
+    if is_known.sum() == 0 or (~is_known).sum() == 0:
+        raise ValueError("Need both known and unknown samples to compute fixed-FAR metrics.")
+
+    # Threshold chosen from positives + negatives under FAR constraint
+    stats = find_threshold_for_target_far(
+        known_values=scores[is_known],
+        unknown_values=scores[~is_known],
+        target_far=target_far,
+        score_type=score_type,
+    )
+
+    threshold = float(stats["threshold"])
+    thresholded = apply_threshold_to_results(
+        results,
+        threshold=threshold,
+        score_key=score_key,
+        score_type=score_type,
+    )
+
+    preds = np.array(thresholded["predictions"], dtype=object)
+
+    known_mask = is_known
+    unknown_mask = ~is_known
+
+    acc_plus_5 = float(np.mean(preds[known_mask] == true_labels[known_mask]))
+    frr_plus_5 = float(np.mean(preds[known_mask] == "unknown"))
+    far_at_5 = float(np.mean(preds[unknown_mask] != "unknown"))
+
+    _, _, _, auroc = compute_roc(results, score_key=score_key, score_type=score_type)
+
+    return {
+        "acc_plus_5": acc_plus_5,
+        "auroc": float(auroc),
+        "frr_plus_5": frr_plus_5,
+        "far_at_5": far_at_5,
+        "threshold_5": threshold,
+        "thresholded_results": thresholded,
+    }
 def print_results_table(
     all_results: Dict[str, Dict],
     timing_info: Dict[str, Dict] = None
 ):
-    """
-    Print a formatted comparison table of all methods.
-    """
-    print("\n" + "=" * 80)
-    print("RESULTS COMPARISON")
-    print("=" * 80)
-    
-    header = (f"{'Method':<25} {'Known Acc':>10} {'Unk Rej':>10} "
-              f"{'FAR':>8} {'FRR':>8} {'Bal Acc':>10} {'AUC':>8}")
-    print(header)
-    print("-" * 80)
-    
-    for method, metrics in all_results.items():
-        row = (
-            f"{method:<25} "
-            f"{metrics.get('known_accuracy', 0)*100:>9.1f}% "
-            f"{metrics.get('unknown_rejection_accuracy', 0)*100:>9.1f}% "
-            f"{metrics.get('false_acceptance_rate', 0)*100:>7.1f}% "
-            f"{metrics.get('false_rejection_rate', 0)*100:>7.1f}% "
-            f"{metrics.get('balanced_accuracy', 0)*100:>9.1f}% "
-            f"{metrics.get('auc', 0):>7.3f}"
+    has_official_metrics = any(
+        ("acc_plus_5" in metrics or "auroc" in metrics or "frr_plus_5" in metrics)
+        for metrics in all_results.values()
+    )
+
+    if has_official_metrics:
+        print("\n" + "=" * 110)
+        print("RESULTS COMPARISON (OFFICIAL METRICS)")
+        print("=" * 110)
+
+        header = (
+            f"{'Method':<25} {'ACC+_5%':>10} {'AUROC':>10} "
+            f"{'FRR+_5%':>10} {'FAR@thr':>10} {'Thr@5%':>12}"
         )
-        print(row)
-    
+        print(header)
+        print("-" * 110)
+
+        for method, metrics in all_results.items():
+            row = (
+                f"{method:<25} "
+                f"{metrics.get('acc_plus_5', metrics.get('known_accuracy', 0)) * 100:>9.1f}% "
+                f"{metrics.get('auroc', metrics.get('auc', 0)):>9.3f} "
+                f"{metrics.get('frr_plus_5', metrics.get('false_rejection_rate', 0)) * 100:>9.1f}% "
+                f"{metrics.get('far_at_5', metrics.get('false_acceptance_rate', 0)) * 100:>9.1f}% "
+                f"{metrics.get('threshold_5', metrics.get('threshold', 0)):>11.4f}"
+            )
+            print(row)
+    else:
+        print("\n" + "=" * 108)
+        print("RESULTS COMPARISON")
+        print("=" * 108)
+
+        header = (
+            f"{'Method':<25} {'Known Acc':>10} {'Unk Rej':>10} "
+            f"{'FAR':>8} {'FRR':>8} {'Bal Acc':>10} {'AUC':>8} {'Val FAR':>9}"
+        )
+        print(header)
+        print("-" * 108)
+
+        for method, metrics in all_results.items():
+            row = (
+                f"{method:<25} "
+                f"{metrics.get('known_accuracy', 0) * 100:>9.1f}% "
+                f"{metrics.get('unknown_rejection_accuracy', 0) * 100:>9.1f}% "
+                f"{metrics.get('false_acceptance_rate', 0) * 100:>7.1f}% "
+                f"{metrics.get('false_rejection_rate', 0) * 100:>7.1f}% "
+                f"{metrics.get('balanced_accuracy', 0) * 100:>9.1f}% "
+                f"{metrics.get('auc', 0):>7.3f} "
+                f"{metrics.get('val_far', 0) * 100:>8.1f}%"
+            )
+            print(row)
+
     if timing_info:
-        print("\n" + "-" * 80)
-        print(f"{'Method':<25} {'Params':>10} {'Inference (ms)':>15}")
-        print("-" * 80)
+        print("\n" + "-" * 110)
+        print(f"{'Method':<25} {'Params':>12} {'Storage (MB)':>14} {'Inference (ms)':>15}")
+        print("-" * 110)
         for method, info in timing_info.items():
-            print(f"{method:<25} {info.get('model_params', 0):>10} "
-                  f"{info.get('mean_inference_time_ms', 0):>14.1f}")
-    
-    print("=" * 80)
-    
-# Add to evaluation.py
+            storage_mb = info.get("storage_bytes", 0) / (1024 ** 2)
+            print(
+                f"{method:<25} {info.get('model_params', 0):>12} "
+                f"{storage_mb:>13.3f} {info.get('mean_inference_time_ms', 0):>14.1f}"
+            )
+
+    print("=" * 110)
 
 def compute_operating_points(results: Dict, score_key: str = 'distances',
                               score_type: str = 'distance') -> Dict:
@@ -356,3 +548,44 @@ def print_operating_points_table(all_op_points: Dict[str, Dict]):
                       f"{p.get('balanced_acc', 0)*100:>9.1f}%")
 
     print("=" * 90)
+    
+def save_metrics_csv(
+    all_results: Dict[str, Dict],
+    timing_info: Dict[str, Dict] = None,
+    save_path: str = "./results/baseline_results_table.csv"
+):
+    rows = []
+    for method, metrics in all_results.items():
+        row = {
+            "method": method,
+            "known_accuracy": metrics.get("known_accuracy", 0.0),
+            "unknown_rejection_accuracy": metrics.get("unknown_rejection_accuracy", 0.0),
+            "false_acceptance_rate": metrics.get("false_acceptance_rate", 0.0),
+            "false_rejection_rate": metrics.get("false_rejection_rate", 0.0),
+            "known_confusion_rate": metrics.get("known_confusion_rate", 0.0),
+            "overall_accuracy": metrics.get("overall_accuracy", 0.0),
+            "balanced_accuracy": metrics.get("balanced_accuracy", 0.0),
+            "auc": metrics.get("auc", 0.0),
+            "auroc": metrics.get("auroc", metrics.get("auc", 0.0)),
+            "acc_plus_5": metrics.get("acc_plus_5", metrics.get("known_accuracy", 0.0)),
+            "frr_plus_5": metrics.get("frr_plus_5", metrics.get("false_rejection_rate", 0.0)),
+            "far_at_5": metrics.get("far_at_5", metrics.get("false_acceptance_rate", 0.0)),
+            "threshold": metrics.get("threshold", 0.0),
+            "threshold_5": metrics.get("threshold_5", metrics.get("threshold", 0.0)),
+            "val_far": metrics.get("val_far", 0.0),
+            "val_frr": metrics.get("val_frr", 0.0),
+        }
+        if timing_info and method in timing_info:
+            row["mean_inference_time_ms"] = timing_info[method].get("mean_inference_time_ms", 0.0)
+            row["std_inference_time_ms"] = timing_info[method].get("std_inference_time_ms", 0.0)
+            row["model_params"] = timing_info[method].get("model_params", 0)
+            row["storage_bytes"] = timing_info[method].get("storage_bytes", 0)
+        rows.append(row)
+
+    fieldnames = sorted({k for row in rows for k in row.keys()})
+    with open(save_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Results table saved to {save_path}")

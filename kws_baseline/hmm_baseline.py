@@ -1,36 +1,52 @@
+import copy
 import time
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-from hmmlearn import hmm
 import warnings
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
+from hmmlearn import hmm
 from tqdm import tqdm
 
 from config import Config, HMMConfig
 from data_loader import FewShotSplit
+from evaluation import find_threshold_for_target_far
 from feature_extraction import extract_features_batch
+
+HMMModel = Union[hmm.GaussianHMM, hmm.GMMHMM]
 
 
 def build_left_right_hmm(
     n_states: int,
     n_features: int,
     hmm_config: HMMConfig
-) -> hmm.GaussianHMM:
-    """Build a left-to-right HMM with constrained transitions."""
-    model = hmm.GaussianHMM(
-        n_components=n_states,
-        covariance_type=hmm_config.covariance_type,
-        n_iter=hmm_config.n_iter,
-        verbose=False,
-        params="stmc",
-        init_params=""
-    )
+) -> HMMModel:
+    """Build a left-to-right HMM or GMM-HMM."""
+    use_gmm = hmm_config.n_mix > 1
 
-    # Start in state 0
+    if use_gmm:
+        model = hmm.GMMHMM(
+            n_components=n_states,
+            n_mix=hmm_config.n_mix,
+            covariance_type=hmm_config.covariance_type,
+            n_iter=hmm_config.n_iter,
+            verbose=False,
+            params="mcw",
+            init_params="",
+        )
+    else:
+        model = hmm.GaussianHMM(
+            n_components=n_states,
+            covariance_type=hmm_config.covariance_type,
+            n_iter=hmm_config.n_iter,
+            verbose=False,
+            params="mc",
+            init_params="",
+        )
+
     startprob = np.zeros(n_states)
     startprob[0] = 1.0
     model.startprob_ = startprob
 
-    # Left-to-right transitions
     transmat = np.zeros((n_states, n_states))
     for i in range(n_states - 1):
         transmat[i, i] = 0.7
@@ -38,49 +54,96 @@ def build_left_right_hmm(
     transmat[-1, -1] = 1.0
     model.transmat_ = transmat
 
-    # Initialize emissions
-    model.means_ = np.random.randn(n_states, n_features) * 0.01
-    if hmm_config.covariance_type == 'diag':
-        model.covars_ = np.ones((n_states, n_features))
-    elif hmm_config.covariance_type == 'full':
-        model.covars_ = np.array([np.eye(n_features) for _ in range(n_states)])
+    if use_gmm:
+        model.weights_ = np.full((n_states, hmm_config.n_mix), 1.0 / hmm_config.n_mix)
+        model.means_ = np.zeros((n_states, hmm_config.n_mix, n_features))
+        if hmm_config.covariance_type == "diag":
+            model.covars_ = np.ones((n_states, hmm_config.n_mix, n_features))
+        elif hmm_config.covariance_type == "full":
+            model.covars_ = np.tile(
+                np.eye(n_features)[None, None, :, :],
+                (n_states, hmm_config.n_mix, 1, 1),
+            )
+        else:
+            raise ValueError(f"Unsupported covariance type: {hmm_config.covariance_type}")
+    else:
+        model.means_ = np.zeros((n_states, n_features))
+        if hmm_config.covariance_type == "diag":
+            model.covars_ = np.ones((n_states, n_features))
+        elif hmm_config.covariance_type == "full":
+            model.covars_ = np.tile(np.eye(n_features)[None, :, :], (n_states, 1, 1))
+        else:
+            raise ValueError(f"Unsupported covariance type: {hmm_config.covariance_type}")
 
     return model
 
 
 def initialize_hmm_with_data(
-    model: hmm.GaussianHMM,
+    model: HMMModel,
     features_list: List[np.ndarray],
     hmm_config: HMMConfig
-) -> hmm.GaussianHMM:
-    """Initialize HMM parameters via uniform segmentation of enrollment data."""
+) -> HMMModel:
+    """Initialize emissions from uniform segmentation."""
     n_states = model.n_components
     n_features = features_list[0].shape[1]
 
     state_frames = [[] for _ in range(n_states)]
     for feat in features_list:
         n_frames = len(feat)
-        frames_per_state = n_frames // n_states
+        frames_per_state = max(1, n_frames // n_states)
         for s in range(n_states):
             start = s * frames_per_state
             end = (s + 1) * frames_per_state if s < n_states - 1 else n_frames
             state_frames[s].append(feat[start:end])
 
-    means = np.zeros((n_states, n_features))
-    covars = np.zeros((n_states, n_features))
+    state_means = np.zeros((n_states, n_features))
+    state_covars = np.zeros((n_states, n_features))
+
     for s in range(n_states):
         all_frames = np.vstack(state_frames[s])
-        means[s] = np.mean(all_frames, axis=0)
-        covars[s] = np.var(all_frames, axis=0) + hmm_config.cov_regularization
+        state_means[s] = np.mean(all_frames, axis=0)
+        state_covars[s] = np.var(all_frames, axis=0) + hmm_config.cov_regularization
 
-    model.means_ = means
-    if hmm_config.covariance_type == 'diag':
-        model.covars_ = covars
-    elif hmm_config.covariance_type == 'full':
-        model.covars_ = np.array([np.diag(covars[s]) for s in range(n_states)])
+    if isinstance(model, hmm.GMMHMM):
+        rng = np.random.default_rng(0)
+        means = np.repeat(state_means[:, None, :], hmm_config.n_mix, axis=1)
+
+        for s in range(n_states):
+            all_frames = np.vstack(state_frames[s])
+            if len(all_frames) >= hmm_config.n_mix:
+                idx = np.linspace(0, len(all_frames) - 1, hmm_config.n_mix, dtype=int)
+                means[s] = all_frames[idx]
+            else:
+                means[s] += 0.01 * rng.standard_normal((hmm_config.n_mix, n_features))
+
+        model.weights_ = np.full((n_states, hmm_config.n_mix), 1.0 / hmm_config.n_mix)
+        model.means_ = means
+
+        if hmm_config.covariance_type == "diag":
+            model.covars_ = np.repeat(state_covars[:, None, :], hmm_config.n_mix, axis=1)
+        else:
+            model.covars_ = np.array(
+                [[np.diag(state_covars[s]) for _ in range(hmm_config.n_mix)]
+                 for s in range(n_states)]
+            )
+    else:
+        model.means_ = state_means
+        if hmm_config.covariance_type == "diag":
+            model.covars_ = state_covars
+        else:
+            model.covars_ = np.array([np.diag(state_covars[s]) for s in range(n_states)])
 
     return model
 
+
+def _estimate_model_storage_bytes(model: HMMModel) -> int:
+    total = 0
+    for attr in ["startprob_", "transmat_", "weights_", "means_", "covars_"]:
+        if hasattr(model, attr):
+            value = getattr(model, attr)
+            if isinstance(value, np.ndarray):
+                total += value.nbytes
+    return int(total)
 
 class HMMKeywordSpotter:
     """HMM/GMM-based few-shot keyword spotter with open-set rejection."""
@@ -90,26 +153,24 @@ class HMMKeywordSpotter:
         self.hmm_cfg = config.hmm
         self.audio_cfg = config.audio
 
-        self.keyword_models: Dict[str, hmm.GaussianHMM] = {}
+        self.keyword_models: Dict[str, HMMModel] = {}
         self.keywords: List[str] = []
-        self.ubm: Optional[hmm.GaussianHMM] = None
-        self.rejection_threshold: float = float('-inf')
+        self.ubm: Optional[HMMModel] = None
+        self.rejection_threshold: float = float("-inf")
+        self.last_threshold_stats: Dict[str, float] = {}
 
     def _train_single_hmm(
         self, keyword: str, features_list: List[np.ndarray]
-    ) -> hmm.GaussianHMM:
-        """Train HMM for a single keyword."""
+    ) -> HMMModel:
+        """Train one keyword model; fall back to Gaussian if GMM-HMM is unstable."""
         n_features = features_list[0].shape[1]
         avg_frames = np.mean([len(f) for f in features_list])
-        effective_states = min(
-            self.hmm_cfg.n_states,
-            max(3, int(avg_frames / 10))
-        )
+        effective_states = min(self.hmm_cfg.n_states, max(3, int(avg_frames / 10)))
 
-        model = build_left_right_hmm(
-            effective_states, n_features, self.hmm_cfg
-        )
-        model = initialize_hmm_with_data(model, features_list, self.hmm_cfg)
+        train_cfg = copy.deepcopy(self.hmm_cfg)
+
+        model = build_left_right_hmm(effective_states, n_features, train_cfg)
+        model = initialize_hmm_with_data(model, features_list, train_cfg)
 
         X = np.vstack(features_list)
         lengths = [len(f) for f in features_list]
@@ -118,67 +179,64 @@ class HMMKeywordSpotter:
             warnings.simplefilter("ignore")
             try:
                 model.fit(X, lengths)
-            except Exception as e:
-                print(f"  Warning: HMM training failed for '{keyword}': {e}")
+            except Exception as exc:
+                if train_cfg.n_mix > 1:
+                    print(
+                        f"  Warning: GMM-HMM training failed for '{keyword}', "
+                        f"falling back to GaussianHMM: {exc}"
+                    )
+                    train_cfg.n_mix = 1
+                    model = build_left_right_hmm(effective_states, n_features, train_cfg)
+                    model = initialize_hmm_with_data(model, features_list, train_cfg)
+                    model.fit(X, lengths)
+                else:
+                    raise
 
         return model
 
     def _train_ubm(self, split: FewShotSplit):
         """
-        Train UBM on unknown validation data + diverse background speech.
-        NOT using enrollment data (which would bias the UBM toward keywords).
+        Train UBM using background/validation material.
         """
         print("[HMM] Training Universal Background Model (UBM)...")
 
         ubm_files = []
-        # Use val unknown data for UBM (general speech, not keywords)
+
+        if getattr(split, "background_support", None):
+            ubm_files.extend(split.background_support)
+
         ubm_files.extend(split.val_test_unknown)
 
-        # Also grab some val known test data (different from enrolled)
-        for kw, files in split.val_test_known.items():
+        for _, files in split.val_test_known.items():
             ubm_files.extend(files[:20])
 
-        # Also grab some unknown test data (from the actual unknown keywords)
         ubm_files.extend(split.test_unknown[:50])
 
-        if len(ubm_files) == 0:
+        seen = set()
+        deduped = []
+        for fp in ubm_files:
+            if fp not in seen:
+                deduped.append(fp)
+                seen.add(fp)
+        ubm_files = deduped
+
+        if not ubm_files:
             print("  No data for UBM, skipping.")
             self.ubm = None
             return
 
         ubm_features = extract_features_batch(ubm_files, self.audio_cfg)
-        n_features = ubm_features[0].shape[1]
-
-        self.ubm = build_left_right_hmm(
-            self.hmm_cfg.ubm_n_states, n_features, self.hmm_cfg
-        )
-        self.ubm = initialize_hmm_with_data(
-            self.ubm, ubm_features, self.hmm_cfg
-        )
-
-        X = np.vstack(ubm_features)
-        lengths = [len(f) for f in ubm_features]
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            try:
-                self.ubm.fit(X, lengths)
-                print(f"  UBM trained: {self.hmm_cfg.ubm_n_states} states, "
-                      f"{len(ubm_files)} utterances")
-            except Exception as e:
-                print(f"  Warning: UBM training failed: {e}")
-                self.ubm = None
+        self.ubm = self._train_single_hmm("ubm", ubm_features)
+        print(f"  UBM trained on {len(ubm_files)} utterances")
 
     def enroll(
-        self, keywords: List[str], enrollment: Dict[str, List[str]],
-        split: FewShotSplit
+        self, keywords: List[str], enrollment: Dict[str, List[str]], split: FewShotSplit
     ):
-        """Enroll keywords by training per-keyword HMMs."""
+        """Train per-keyword HMM/GMM models."""
         self.keywords = keywords
         self.keyword_models = {}
 
-        k = len(next(iter(enrollment.values())))
-        print(f"[HMM] Enrolling {k}-shot keyword models...")
+        print(f"[HMM] Enrolling {len(next(iter(enrollment.values())))}-shot keyword models...")
 
         for kw in self.keywords:
             features = extract_features_batch(enrollment[kw], self.audio_cfg)
@@ -190,25 +248,22 @@ class HMMKeywordSpotter:
             self._train_ubm(split)
 
     def _score_utterance(self, features: np.ndarray) -> Dict[str, float]:
-        """Score an utterance against all keyword HMMs."""
-        scores = {}
-        n_frames = len(features)
+        """Score utterance against all keyword models."""
+        scores: Dict[str, float] = {}
+        n_frames = max(1, len(features))
 
         ubm_score = None
         if self.ubm is not None:
             try:
-                ubm_score = self.ubm.score(features) / n_frames
-            except:
+                ubm_score = float(self.ubm.score(features) / n_frames)
+            except Exception:
                 ubm_score = -100.0
 
         for kw in self.keywords:
             try:
-                ll = self.keyword_models[kw].score(features) / n_frames
-                if ubm_score is not None:
-                    scores[kw] = ll - ubm_score  # Log-likelihood ratio
-                else:
-                    scores[kw] = ll
-            except:
+                ll = float(self.keyword_models[kw].score(features) / n_frames)
+                scores[kw] = ll - ubm_score if ubm_score is not None else ll
+            except Exception:
                 scores[kw] = -1e10
 
         return scores
@@ -216,25 +271,22 @@ class HMMKeywordSpotter:
     def predict_single(
         self, query_features: np.ndarray
     ) -> Tuple[str, float, Dict[str, float]]:
-        """Predict keyword or reject as unknown."""
         scores = self._score_utterance(query_features)
         best_kw = max(scores, key=scores.get)
         best_score = scores[best_kw]
 
         if best_score < self.rejection_threshold:
             return "unknown", best_score, scores
-        else:
-            return best_kw, best_score, scores
+        return best_kw, best_score, scores
 
     def predict_batch(
         self,
         known_test: Dict[str, List[str]],
         unknown_test: List[str]
     ) -> Dict:
-        """Run prediction on all test utterances."""
         results = {
-            'predictions': [], 'true_labels': [],
-            'scores': [], 'all_scores': [], 'is_known': []
+            "predictions": [], "true_labels": [],
+            "scores": [], "all_scores": [], "is_known": []
         }
 
         print("[HMM] Testing known keywords...")
@@ -242,102 +294,78 @@ class HMMKeywordSpotter:
             features_list = extract_features_batch(known_test[kw], self.audio_cfg)
             for feat in features_list:
                 pred, score, all_scores = self.predict_single(feat)
-                results['predictions'].append(pred)
-                results['true_labels'].append(kw)
-                results['scores'].append(score)
-                results['all_scores'].append(all_scores)
-                results['is_known'].append(True)
+                results["predictions"].append(pred)
+                results["true_labels"].append(kw)
+                results["scores"].append(score)
+                results["all_scores"].append(all_scores)
+                results["is_known"].append(True)
 
         print("[HMM] Testing unknown utterances...")
         unknown_features = extract_features_batch(unknown_test, self.audio_cfg)
         for feat in tqdm(unknown_features):
             pred, score, all_scores = self.predict_single(feat)
-            results['predictions'].append(pred)
-            results['true_labels'].append("unknown")
-            results['scores'].append(score)
-            results['all_scores'].append(all_scores)
-            results['is_known'].append(False)
+            results["predictions"].append(pred)
+            results["true_labels"].append("unknown")
+            results["scores"].append(score)
+            results["all_scores"].append(all_scores)
+            results["is_known"].append(False)
 
         return results
 
     def tune_threshold(self, split: FewShotSplit) -> float:
-        """
-        Tune threshold on VALIDATION keywords (enrolled separately).
-        """
-        print("[HMM] Tuning threshold on validation keywords...")
+        print(
+            f"[HMM] Tuning threshold on validation keywords "
+            f"for target FAR={self.config.eval.target_far:.2%}..."
+        )
 
-        # Temporarily enroll validation keywords
         original_models = self.keyword_models.copy()
         original_keywords = self.keywords.copy()
 
-        val_keywords = split.val_known_keywords
-        val_models = {}
-        for kw in val_keywords:
-            features = extract_features_batch(
-                split.val_enrollment[kw], self.audio_cfg
-            )
-            model = self._train_single_hmm(kw, features)
-            val_models[kw] = model
+        self.keyword_models = {}
+        self.keywords = split.val_known_keywords
+        for kw in split.val_known_keywords:
+            features = extract_features_batch(split.val_enrollment[kw], self.audio_cfg)
+            self.keyword_models[kw] = self._train_single_hmm(kw, features)
 
-        self.keyword_models = val_models
-        self.keywords = val_keywords
-        self.rejection_threshold = float('-inf')  # Accept everything during scoring
+        self.rejection_threshold = float("-inf")
 
-        # Score val known
         val_scores_known = []
-        for kw, files in split.val_test_known.items():
+        for _, files in split.val_test_known.items():
             features = extract_features_batch(files, self.audio_cfg)
             for feat in features:
                 _, score, _ = self.predict_single(feat)
                 val_scores_known.append(score)
 
-        # Score val unknown
         val_scores_unknown = []
-        unknown_features = extract_features_batch(
-            split.val_test_unknown, self.audio_cfg
-        )
+        unknown_features = extract_features_batch(split.val_test_unknown, self.audio_cfg)
         for feat in unknown_features:
             _, score, _ = self.predict_single(feat)
             val_scores_unknown.append(score)
 
-        # Restore original
         self.keyword_models = original_models
         self.keywords = original_keywords
 
-        val_scores_known = np.array(val_scores_known)
-        val_scores_unknown = np.array(val_scores_unknown)
-
-        print(f"  Val known scores:   mean={val_scores_known.mean():.2f}, "
-              f"std={val_scores_known.std():.2f}")
-        print(f"  Val unknown scores: mean={val_scores_unknown.mean():.2f}, "
-              f"std={val_scores_unknown.std():.2f}")
-
-        all_scores = np.concatenate([val_scores_known, val_scores_unknown])
-        thresholds = np.linspace(
-            np.percentile(all_scores, 1),
-            np.percentile(all_scores, 99),
-            200
+        stats = find_threshold_for_target_far(
+            known_values=np.array(val_scores_known),
+            unknown_values=np.array(val_scores_unknown),
+            target_far=self.config.eval.target_far,
+            score_type="score",
         )
 
-        best_threshold = thresholds[0]
-        best_bal_acc = 0
+        self.rejection_threshold = stats["threshold"]
+        self.last_threshold_stats = stats
 
-        for t in thresholds:
-            known_accepted = np.mean(val_scores_known >= t)
-            unknown_rejected = np.mean(val_scores_unknown < t)
-            bal_acc = (known_accepted + unknown_rejected) / 2
-            if bal_acc > best_bal_acc:
-                best_bal_acc = bal_acc
-                best_threshold = t
+        print(
+            f"  Threshold={stats['threshold']:.4f} | "
+            f"val FAR={stats['far'] * 100:.2f}% | "
+            f"val FRR={stats['frr'] * 100:.2f}% | "
+            f"known accept={stats['known_accept_rate'] * 100:.2f}%"
+        )
 
-        self.rejection_threshold = best_threshold
-        print(f"  Best threshold: {best_threshold:.4f} "
-              f"(balanced acc: {best_bal_acc:.4f})")
-
-        return best_threshold
+        return self.rejection_threshold
 
     def get_timing_info(self, n_samples: int = 10) -> Dict:
-        """Measure inference time and model size."""
+        """Measure inference time and storage footprint."""
         n_features = self.audio_cfg.n_mfcc * (
             3 if self.audio_cfg.include_delta else 1
         )
@@ -350,15 +378,23 @@ class HMMKeywordSpotter:
             times.append(time.time() - start)
 
         total_params = 0
-        for kw, model in self.keyword_models.items():
-            n_s = model.n_components
-            total_params += n_s * n_s + n_s * n_features * 2 + n_s
+        storage_bytes = 0
+
+        for model in self.keyword_models.values():
+            for attr in ["startprob_", "transmat_", "weights_", "means_", "covars_"]:
+                if hasattr(model, attr):
+                    value = getattr(model, attr)
+                    if isinstance(value, np.ndarray):
+                        total_params += value.size
+            storage_bytes += _estimate_model_storage_bytes(model)
+
+        if self.ubm is not None:
+            storage_bytes += _estimate_model_storage_bytes(self.ubm)
 
         return {
-            'mean_inference_time_ms': np.mean(times) * 1000,
-            'std_inference_time_ms': np.std(times) * 1000,
-            'model_params': total_params,
-            'n_keyword_models': len(self.keyword_models)
+            "mean_inference_time_ms": float(np.mean(times) * 1000),
+            "std_inference_time_ms": float(np.std(times) * 1000),
+            "model_params": int(total_params),
+            "storage_bytes": int(storage_bytes),
+            "n_keyword_models": len(self.keyword_models),
         }
-
-
