@@ -1,4 +1,4 @@
-# Few-Shot Open-Set Learning for On-Device Customization of KWS
+# On-Device Few-Shot Open-Set Keyword Spotting
 
 This repo contains two main approaches for few-shot open-set KWS:
 
