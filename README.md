@@ -1,6 +1,6 @@
 # Few-Shot Open-Set Learning for On-Device Customization of KWS
 
-This repository contains two complementary approaches for few-shot open-set keyword spotting on the Google Speech Commands dataset:
+This repo contains two main approaches for few-shot open-set KWS:
 
 | Folder | Approach |
 |--------|----------|
@@ -81,11 +81,11 @@ After extraction, audio files will be in `data/MSWC/audio/en/clips/` and split C
 # Extract file paths from the full splits file
 scripts/get-links data/MSWC/ en
 
-# Convert to wav (64 parallel workers)
+# Convert to wav
 scripts/wav-convert data/MSWC/ en
 ```
 
-**Compute word frequencies** (required for partition generation):
+**Compute word frequencies** (run this first before generating partition):
 
 ```bash
 scripts/mswc-freq data/MSWC/
