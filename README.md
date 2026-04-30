@@ -315,3 +315,28 @@ Or use the convenience script:
 ```bash
 bash run.sh
 ```
+
+---
+
+## Reproduce Best System Result
+
+```bash
+cd dl_branch
+```
+
+Then run the evaluation with the provided checkpoint:
+
+```bash
+python KWSFSL/test_fewshots_classifiers_openset.py \
+  --data.cuda \
+  --speech.dataset googlespeechcommand \
+  --speech.task GSC12,GSC22 \
+  --speech.include_unknown \
+  --fsl.test.n_way 11 \
+  --fsl.test.n_episodes 10 \
+  --speech.default_datadir data/GSC/ \
+  --fsl.test.batch_size 264 \
+  --fsl.classifier openncm \
+  --fsl.test.n_support 5 \
+  --model.model_path results/multi_teacher_distill/best_model.pt
+```
