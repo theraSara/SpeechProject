@@ -29,6 +29,12 @@ python -m pip install --no-build-isolation libmr
 pip install -r requirements.txt
 ```
 
+There might be some missing requirements after installing, but they will be common library, so you could run directly
+
+```bash
+pip install <library_name>
+```
+
 ### Repository Overview
 All the used scripts are included in the `KWSFSL/` folder:
 * `metric_learning.py`: main training script for the student encoder
