@@ -1,0 +1,15 @@
+#!/bin/bash
+if [ -z $1 ] || [ -z $2 ]; then echo "usage: get-links DATASET_HOME language"; exit 0; fi
+cd $1
+lang=$2
+
+outdir='links'
+mkdir -p $outdir
+
+tail -n +2 splits/${lang}_splits.csv | python3 -c "
+import sys
+for line in sys.stdin:
+    print(line.split(',')[1])
+" > $outdir/$lang.links
+
+echo "Done: $(wc -l < $outdir/$lang.links) links written to $outdir/$lang.links"

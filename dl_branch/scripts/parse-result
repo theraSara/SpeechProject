@@ -1,0 +1,16 @@
+#!/opt/conda/bin/python
+import json
+from sys import argv
+
+FILE = argv[1]
+with open(FILE) as f:
+    f.readline()
+    result = json.load(f)
+result = result['test']
+
+fields = ['aucROC', 'acc_prec95', 'frr_prec95']
+for field in fields:
+    mean = round(result[field]['mean'], 3)
+    std = round(result[field]['std'], 3)
+
+    print(mean, '±', std)

@@ -1,0 +1,26 @@
+#!/usr/bin/bash
+if [ -z $1 ]; then echo "usage: mswc-freq DATASET_HOME"; exit 1; fi
+cd $1
+
+langs=$(ls splits/*.csv 2>/dev/null | xargs -n1 basename | cut -d_ -f1 | sort -u) || exit 1
+splits="train dev test"
+
+handle_lang() {
+  lang=$1
+  outdir="frequency/$lang"
+  mkdir -p $outdir
+
+  for split in $splits; do
+    file="splits/${lang}_${split}.csv"
+    idx=2
+
+    awk -F, -v i=$idx 'NR > 1 {print $i}' $file | uniq -c | sort -rh |
+    awk '{printf "%-15s%s\n", $1, $2}' > $outdir/$split.freq &
+  done && wait
+  echo "finish language $lang"
+}
+
+for lang in $langs; do
+  handle_lang $lang &
+done && wait
+

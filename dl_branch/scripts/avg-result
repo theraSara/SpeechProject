@@ -1,0 +1,25 @@
+#!/opt/conda/bin/python
+import numpy as np
+from sys import argv
+FILE = argv[1]
+
+L = []
+with open(FILE) as f:
+    for i, line in enumerate(f):
+        if i % 4 == 0: continue
+        line = line.strip()
+        line = line.replace(' ± ', '\t')
+
+        values = [float(x) for x in line.split('\t')]
+        L.append(values)
+
+a = np.array(L)
+for i in range(3):
+    v = a[i::3,:]
+    v = v.mean(axis=0)
+    for i, x in enumerate(v):
+        x = round(x, 3)
+        end = ' ± ' if i%2==0 else '|'
+        print(x, end=end)
+    print()
+

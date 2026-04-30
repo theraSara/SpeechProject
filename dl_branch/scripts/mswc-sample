@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+
+import heapq
+from argparse import ArgumentParser
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+import random
+from multiprocessing import Process
+
+parser = ArgumentParser()
+parser.add_argument('where', metavar='DATASET_HOME')
+parser.add_argument('what', metavar='SPLIT', choices=["train", "dev", "test"])
+
+parser.add_argument('-l', metavar='LANGUAGE', nargs='+', default=[],
+        dest='langs', help='languages to include')
+parser.add_argument('-x', metavar='LANGUAGE', nargs='+', default=[],
+        dest='exclude', help='languages to exclude')
+
+parser.add_argument('-b', metavar='N', default=0, type=int,
+        dest='baseline', help='num files lower bound')
+parser.add_argument('-t', metavar='N', default=-1, type=int,
+        dest='threshold', help='num files upper bound')
+
+parser.add_argument('-n', metavar='N', default=0, type=int,
+        dest='num_words', help='num words to take')
+parser.add_argument('-r', action='store_true',
+        dest="reverse", help="reverse the histogram")
+parser.add_argument('-seed', default=None, type=int,
+        help="seed to shuffle the histogram")
+
+parser.add_argument('-go', action='store_true',
+        help='execute the preview, should redirect stdout')
+parser.add_argument('-goseed', default=0, type=int,
+        help='seed for select audio files')
+args = parser.parse_args()
+
+
+@dataclass
+class Word:
+    lang: str
+    value: str
+    freq: int
+
+    def __str__(self):
+        return f"{self.lang.replace('-', '_')}_{self.value}"
+
+    def __eq__(self, other):
+        return self.freq == other.freq
+
+    def __lt__(self, other):
+        return self.freq < other.freq
+
+
+HOME_DIR = Path(args.where)
+
+def refine(lang: str):
+    FILE = HOME_DIR / "frequency" / lang / f"{args.what}.freq"
+    if not FILE.is_file(): return []
+
+    words = []
+    with FILE.open() as f:
+        for line in f:
+            count, word = line.split()
+            count = int(count)
+
+            if count < args.baseline:
+                continue
+            if args.threshold > 0:
+                count = min(count, args.threshold)
+
+            word = Word(lang, word, count)
+            words.append(word)
+
+    return words
+
+
+langs = set(args.langs)
+if not langs:
+    langs = {f.stem.split('_')[0] for f in (HOME_DIR / "splits").iterdir() if f.suffix == '.csv'}
+langs = sorted(langs - set(args.exclude))
+
+H = list(heapq.merge(*[refine(lang) for lang in langs], reverse=True))
+if args.seed is not None:
+    random.seed(args.seed)
+    random.shuffle(H)
+    H.sort(reverse=True)
+
+if args.reverse: H.reverse()
+num_words = int(args.num_words)
+if num_words:
+    H = H[:num_words] if num_words >= 0 else H[-num_words:]
+
+
+lang_words = defaultdict(list)
+for word in H: lang_words[word.lang].append(word)
+
+if not args.go: # PREVIEW
+    lang_stat = {}
+    total_words = total_files = 0
+    for lang, words in lang_words.items():
+        num_words = len(words)
+        num_files = sum(w.freq for w in words)
+
+        total_words += num_words
+        total_files += num_files
+
+        lang_stat[lang] = {
+            "num_words": num_words,
+            "num_files": num_files
+        }
+
+    lang_stat["TOTAL"] = {
+        "num_words": total_words,
+        "num_files": total_files,
+    }
+
+    langs_order = sorted(lang_stat, key=lambda k: lang_stat[k]["num_files"])
+    for lang in langs_order:
+        num_words = lang_stat[lang]["num_words"]
+        num_files = lang_stat[lang]["num_files"]
+        print(f"{lang:<15}{num_words:<10}{num_files}")
+    exit(0)
+
+# EXECUTE
+@dataclass
+class Extractor:
+    split: str
+    lang: str
+    words: list
+
+    def extract(self):
+        word_lines = self.get_lines()
+        for word in self.words:
+            lines = word_lines[str(word)]
+            random.seed(args.goseed)
+            lines = random.sample(lines, word.freq)
+
+            print(*lines, sep='', end='')
+
+    def get_lines(self):
+        word_lines = {str(word) : [] for word in self.words}
+
+        FILE = HOME_DIR / "splits" / f"{self.lang}_{self.split}.csv"
+        with FILE.open() as f:
+            f.readline()
+            for line in f:
+                link, word, rest = line.split(',', maxsplit=2)
+
+                word = str(Word(self.lang, word, 0))
+                if word not in word_lines: continue
+                link = self.extend(link)
+
+                line = ','.join([link, word, rest])
+                word_lines[word].append(line)
+
+        return word_lines
+
+    def extend(self, link: str):
+        return f"{self.lang}/clips/{link}"
+
+
+header = 'LINK,WORD,VALID,SPEAKER,GENDER'
+print(header)
+
+extractors = [
+    Extractor(args.what, lang, words)
+    for lang, words in lang_words.items()
+]
+ps = [Process(target=extractor.extract) for extractor in extractors]
+for p in ps: p.start()
+for p in ps: p.join()
+

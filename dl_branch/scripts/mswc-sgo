@@ -1,0 +1,5 @@
+#!/bin/bash
+if [ -z $1 ]; then echo "usage: mswc-sgo file args"; exit 1; fi
+file=$1; shift
+mswc-sample $@ -go | tqdm > $file
+
